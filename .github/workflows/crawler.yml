@@ -44,7 +44,7 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: read
+  contents: write
   actions: write
 
 jobs:
@@ -93,24 +93,6 @@ jobs:
             fi
           fi
 
-
-      # --------------------------------------------------------------------------------
-      # 🚦 TRAFFIC CONTROL / 流量控制
-      # --------------------------------------------------------------------------------
-      # EN: Generates a random delay between 1 and 300 seconds (5 minutes).
-      #     Critical for load balancing.
-      #
-      # CN: 生成 1 到 300 秒（5分钟）之间的随机延迟。
-      #     这对负载均衡至关重要。
-      # - name: Random Delay (Traffic Control)
-      #   if: success()
-      #   run: |
-      #     echo "🎲 Traffic Control: Generating random delay..."
-      #     DELAY=$(( ( RANDOM % 300 )  + 1 ))
-      #     echo "⏸️  Sleeping for ${DELAY} seconds to spread the load..."
-      #     sleep ${DELAY}s
-      #     echo "▶️  Delay finished. Starting crawler..."
-
       - name: Set up Python
         if: success()
         uses: actions/setup-python@v6
@@ -133,6 +115,61 @@ jobs:
             exit 1
           fi
 
+      # ★ 启动本地 webhook 截获服务（情报中枢本地拉取方案）
+      - name: Start webhook capture server
+        if: success()
+        run: |
+          cat > /tmp/webhook_capture.py << 'PYEOF'
+          import http.server, json, os, threading, time
+          from datetime import datetime, timezone
+
+          CAPTURE_DIR = "webhook_payloads"
+          os.makedirs(CAPTURE_DIR, exist_ok=True)
+          counter = 0
+
+          class CaptureHandler(http.server.BaseHTTPRequestHandler):
+              def do_POST(self):
+                  global counter
+                  length = int(self.headers.get("Content-Length", 0))
+                  body = self.rfile.read(length) if length > 0 else b""
+                  try:
+                      payload = json.loads(body) if body else {}
+                  except:
+                      payload = {"raw": body.decode("utf-8", errors="replace")}
+
+                  counter += 1
+                  ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+                  filename = f"{CAPTURE_DIR}/payload_{ts}_{counter:03d}.json"
+                  with open(filename, "w", encoding="utf-8") as f:
+                      json.dump({
+                          "captured_at": datetime.now(timezone.utc).isoformat(),
+                          "batch_index": counter,
+                          **payload
+                      }, f, ensure_ascii=False, indent=2)
+                  print(f"[Capture] Saved {filename} ({length} bytes)")
+
+                  self.send_response(200)
+                  self.send_header("Content-Type", "application/json")
+                  self.end_headers()
+                  self.wfile.write(b'{"ok":true}')
+
+              def log_message(self, format, *args):
+                  pass
+
+          server = http.server.HTTPServer(("127.0.0.1", 18888), CaptureHandler)
+          print(f"[Capture] Listening on 127.0.0.1:18888")
+
+          thread = threading.Thread(target=server.serve_forever, daemon=True)
+          thread.start()
+
+          while True:
+              time.sleep(60)
+          PYEOF
+          python3 /tmp/webhook_capture.py &
+          sleep 1
+          echo "Webhook capture server started on :18888"
+
+      # ★ 运行爬虫（GENERIC_WEBHOOK_URL 指向本地截获服务）
       - name: Run crawler
         if: success()
         env:
@@ -152,10 +189,10 @@ jobs:
           NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
           BARK_URL: ${{ secrets.BARK_URL }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          # 通用Webhook配置
-          GENERIC_WEBHOOK_URL: ${{ secrets.GENERIC_WEBHOOK_URL }}
-          GENERIC_WEBHOOK_TEMPLATE: ${{ secrets.GENERIC_WEBHOOK_TEMPLATE }}
-          # AI 配置（ai_analysis 和 ai_translation 共享模型配置）
+          # ★ 通用Webhook → 指向本地截获服务
+          GENERIC_WEBHOOK_URL: "http://127.0.0.1:18888"
+          GENERIC_WEBHOOK_TEMPLATE: '{"title":"{title}","content":"{content}","source":"trendradar"}'
+          # AI 配置
           AI_ANALYSIS_ENABLED: ${{ secrets.AI_ANALYSIS_ENABLED }}
           AI_API_KEY: ${{ secrets.AI_API_KEY }}
           AI_MODEL: ${{ secrets.AI_MODEL }}
@@ -168,3 +205,51 @@ jobs:
           S3_REGION: ${{ secrets.S3_REGION }}
           GITHUB_ACTIONS: true
         run: uv run python -m trendradar
+
+      # ★ 将截获的 webhook 数据提交到 data 分支
+      - name: Commit captured data to data branch
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # 检查是否有截获的数据
+          if [ ! -d webhook_payloads ] || [ -z "$(ls webhook_payloads/*.json 2>/dev/null)" ]; then
+            echo "No webhook payloads captured, skipping commit"
+            exit 0
+          fi
+
+          FILE_COUNT=$(ls webhook_payloads/*.json | wc -l)
+          echo "Captured $FILE_COUNT payload file(s)"
+
+          # 保存截获的文件到临时目录
+          cp -r webhook_payloads /tmp/webhook_payloads_backup
+
+          # 配置 git
+          git config user.name "TrendRadar Bot"
+          git config user.email "trendradar-bot@users.noreply.github.com"
+
+          # 尝试切换到已有的 data 分支，如果不存在则创建孤立分支
+          git fetch origin data 2>/dev/null && git checkout data || {
+            echo "Creating new orphan branch: data"
+            git checkout --orphan data
+            git rm -rf . 2>/dev/null || true
+          }
+
+          # 清理旧的 payload 文件（每次只保留最新一批）
+          rm -rf webhook_payloads
+          mkdir -p webhook_payloads
+
+          # 从备份恢复截获的文件
+          cp /tmp/webhook_payloads_backup/*.json webhook_payloads/
+
+          # 写入元数据
+          echo "{\"updated_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\", \"file_count\": $FILE_COUNT}" > webhook_payloads/meta.json
+
+          # 提交并推送
+          git add webhook_payloads/
+          git commit -m "auto: captured $FILE_COUNT payloads at $(date -u +%Y-%m-%dT%H:%M:%SZ)" || {
+            echo "Nothing to commit"
+            exit 0
+          }
+          git push origin data --force
+          echo "✅ Pushed $FILE_COUNT payload(s) to data branch"
